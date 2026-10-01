@@ -1,0 +1,118 @@
+name: GHAV OpenReplay 3822 Alerts image
+on:
+  push:
+    branches:
+      - codex/ghav-openreplay3822-before
+      - codex/ghav-openreplay3822-human
+      - codex/ghav-openreplay3822-ours
+      - codex/ghav-openreplay3822-diag-ours
+permissions:
+  contents: read
+jobs:
+  alerts-image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout fixed historical source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 2f942beebbef53d5d4c11f7bd1ac14b8aca00855
+          persist-credentials: false
+      - name: Verify fixed full image inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "2f942beebbef53d5d4c11f7bd1ac14b8aca00855"
+          echo "GHAV_SOURCE_SHA=$(git rev-parse HEAD)"
+          sha256sum api/Dockerfile_alerts api/build_alerts.sh api/requirements-alerts.txt api/Dockerfile_alerts.dockerignore
+          docker version --format 'GHAV_DOCKER_VERSION={{.Client.Version}}/{{.Server.Version}}'
+      - name: Apply identical external build-input pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/ghav-openreplay3822-common.py <<'PY'
+          #!/usr/bin/env python3
+          """Pin floating external build inputs for OpenReplay #3822 in all arms."""
+
+          import hashlib
+          from pathlib import Path
+
+
+          FILE = Path("api/Dockerfile_alerts")
+          EXPECTED_SHA256 = "78ffca9d46330feec20bcf721d9a19eb5d72a220859d4b3a45790950ecf69f93"
+          REPLACEMENTS = (
+              (
+                  "FROM python:3.13-alpine",
+                  "FROM python:3.13-alpine@sha256:f3ebba2ace255c93267a0278da88c7f1044432991abc4e6ad20d22e34dd0f8ee",
+              ),
+              (
+                  "RUN pip install --no-cache-dir --upgrade uv",
+                  "RUN pip install --no-cache-dir uv==0.12.21",
+              ),
+              (
+                  "RUN uv pip install --no-cache-dir --upgrade pip setuptools wheel --system",
+                  "RUN uv pip install --no-cache-dir pip==26.2.1 setuptools==84.0.0 wheel==0.48.0 --system",
+              ),
+          )
+
+
+          def sha256(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+
+
+          def main() -> None:
+              original = FILE.read_bytes()
+              if sha256(original) != EXPECTED_SHA256:
+                  raise SystemExit("unexpected historical Dockerfile bytes")
+              text = original.decode()
+              for before, after in REPLACEMENTS:
+                  if text.count(before) != 1:
+                      raise SystemExit(f"non-unique Dockerfile replacement: {before}")
+                  text = text.replace(before, after, 1)
+              FILE.write_text(text)
+              print("GHAV_PREP_SHA256 {} {}".format(sha256(FILE.read_bytes()), FILE))
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+          python3 /tmp/ghav-openreplay3822-common.py
+
+      - name: Restore historical Docker layer cache
+        uses: satackey/action-docker-layer-caching@46d2c640b1d8ef50d185452ad6fb324e6bd1d052
+        continue-on-error: true
+      - name: Build complete local linux-amd64 Alerts image
+        shell: bash
+        env:
+          DOCKER_BUILDKIT: "1"
+          BUILDKIT_PROGRESS: plain
+          PUSH_IMAGE: "0"
+          PATCH: "0"
+          SIGN_IMAGE: "0"
+          ARCH: amd64
+          DOCKER_REPO: local
+          IMAGE_TAG: ghav-fixed-3822
+        run: |
+          set -euo pipefail
+          cd api
+          bash build_alerts.sh
+      - name: Check and fingerprint complete image output
+        shell: bash
+        run: |
+          set -euo pipefail
+          image=local/alerts:ghav-fixed-3822
+          docker image inspect "$image" > /dev/null
+          echo "GHAV_IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$image")"
+          echo "GHAV_IMAGE_SIZE=$(docker image inspect --format '{{.Size}}' "$image")"
+          docker save "$image" | sha256sum | awk '{print "GHAV_IMAGE_ARCHIVE_SHA256="$1}'
+      - name: Diagnose image byte variance without downloading it
+        shell: bash
+        run: |
+          set -euo pipefail
+          image=local/alerts:ghav-fixed-3822
+          docker image inspect --format 'GHAV_DIAG_CREATED={{.Created}}' "$image"
+          docker image inspect --format 'GHAV_DIAG_LAYERS={{json .RootFS.Layers}}' "$image"
+          docker image inspect --format 'GHAV_DIAG_CONFIG={{json .Config}}' "$image"
+          docker run --rm --entrypoint sh "$image" -c 'find /work -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum' | sed 's/^/GHAV_DIAG_WORK_TREE=/'
+          docker run --rm --entrypoint sh "$image" -c 'find /usr/local/lib/python3.13/site-packages -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum' | sed 's/^/GHAV_DIAG_SITE_TREE=/'
+          docker run --rm --entrypoint sh "$image" -c 'find /usr/local/lib/python3.13/site-packages -name "*.pyc" -type f | wc -l' | sed 's/^/GHAV_DIAG_PYC_COUNT=/'
